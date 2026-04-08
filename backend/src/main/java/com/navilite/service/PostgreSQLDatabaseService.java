@@ -12,26 +12,50 @@ import java.util.*;
 public class PostgreSQLDatabaseService implements DatabaseService {
 
     private Connection getConnection(ConnectionInfo info, String database) throws SQLException {
-        // 核心修复：如果用户未填写用户名，显式默认使用 "postgres"，防止驱动程序自动抓取系统用户名 "root"
-        String user = (info.getUsername() != null && !info.getUsername().isEmpty()) ? info.getUsername() : "postgres";
+        String configuredUser = (info.getUsername() != null && !info.getUsername().isEmpty()) ? info.getUsername() : "postgres";
         String password = info.getPassword();
-        
         String db = (database != null && !database.isEmpty()) ? database :
                 (info.getDatabase() != null && !info.getDatabase().isEmpty() ? info.getDatabase() : "postgres");
         
         String url = String.format("jdbc:postgresql://%s:%d/%s", info.getHost(), info.getPort(), db);
         
-        log.info("Connecting to PostgreSQL: {} as user: {}", url, user);
-        
-        // 使用显式的 user/password 调用，不给驱动程序留下回退到系统用户名的余地
-        if (password != null && !password.isEmpty()) {
-            return DriverManager.getConnection(url, user, password);
-        } else {
-            // 注意：Postgres 即使没有密码，通常也需要 user 参数
-            Properties props = new Properties();
-            props.setProperty("user", user);
-            return DriverManager.getConnection(url, props);
+        try {
+            return attemptConnection(url, configuredUser, password);
+        } catch (SQLException e) {
+            log.warn("PostgreSQL connection failed for user '{}'. Error: {}", configuredUser, e.getMessage());
+            
+            // Fallback 1: Try 'postgres' if it wasn't the first choice
+            if (!"postgres".equals(configuredUser)) {
+                try {
+                    log.info("Attempting Fallback 1: user 'postgres'");
+                    return attemptConnection(url, "postgres", password);
+                } catch (SQLException e2) {
+                    log.warn("Fallback 1 failed: {}", e2.getMessage());
+                }
+            }
+            
+            // Fallback 2: Try current system username (common in local Mac/Linux setups)
+            String systemUser = System.getProperty("user.name");
+            if (systemUser != null && !systemUser.equals(configuredUser) && !systemUser.equals("postgres")) {
+                try {
+                    log.info("Attempting Fallback 2: system user '{}'", systemUser);
+                    return attemptConnection(url, systemUser, password);
+                } catch (SQLException e3) {
+                    log.warn("Fallback 2 failed: {}", e3.getMessage());
+                }
+            }
+            
+            throw e; // If all fallbacks fail, throw the original exception
         }
+    }
+
+    private Connection attemptConnection(String url, String user, String password) throws SQLException {
+        Properties props = new Properties();
+        props.setProperty("user", user);
+        if (password != null && !password.isEmpty()) {
+            props.setProperty("password", password);
+        }
+        return DriverManager.getConnection(url, props);
     }
 
     @Override
@@ -62,11 +86,14 @@ public class PostgreSQLDatabaseService implements DatabaseService {
     @Override
     public List<TableInfo> getTables(ConnectionInfo info, String database) {
         List<TableInfo> tables = new ArrayList<>();
-        // 改进 SQL，不仅查找表名，还要排除系统模式
-        String sql = "SELECT table_name, table_type " +
-                     "FROM information_schema.tables " +
-                     "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') " +
-                     "AND table_schema NOT LIKE 'pg_temp_%' " +
+        // 使用 pg_tables，这在 PostgreSQL 中通常比 information_schema 更快更稳
+        String sql = "SELECT tablename as table_name, 'TABLE' as table_type " +
+                     "FROM pg_tables " +
+                     "WHERE schemaname NOT IN ('information_schema', 'pg_catalog') " +
+                     "UNION ALL " +
+                     "SELECT viewname as table_name, 'VIEW' as table_type " +
+                     "FROM pg_views " +
+                     "WHERE schemaname NOT IN ('information_schema', 'pg_catalog') " +
                      "ORDER BY table_name";
         
         try (Connection conn = getConnection(info, database);
@@ -75,7 +102,7 @@ public class PostgreSQLDatabaseService implements DatabaseService {
             while (rs.next()) {
                 tables.add(TableInfo.builder()
                         .name(rs.getString("table_name"))
-                        .type(rs.getString("table_type").equals("BASE TABLE") ? "TABLE" : "VIEW")
+                        .type(rs.getString("table_type"))
                         .build());
             }
         } catch (SQLException e) {
