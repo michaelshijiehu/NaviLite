@@ -1,0 +1,30 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: navilite
+  
+  datasource:
+    url: jdbc:mysql://localhost:3306/navilite?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: 
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  
+  jpa:
+    hibernate:
+      # Use update or validate since Flyway has established the schema
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        # Explicitly set dialect to skip metadata detection issues
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+  
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+cors:
+  allowed-origins: http://localhost:5173,http://localhost:3000

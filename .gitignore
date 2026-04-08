@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backend (Maven)
+backend/target/
+backend/*.log
+backend/local.properties
+backend/.mvn/wrapper/maven-wrapper.jar
+
+# Frontend (Node)
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+frontend/.eslintcache
+
+# Docker
+docker/mysql/data/
+docker/postgres/data/
+docker/mongo/data/
+
+# SQLite
+backend/data/*.db
+
+# Logs
+*.log
+logs/
