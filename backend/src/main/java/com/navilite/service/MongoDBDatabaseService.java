@@ -95,7 +95,25 @@ public class MongoDBDatabaseService implements DatabaseService {
         QueryResult.QueryResultBuilder builder = QueryResult.builder();
 
         try (MongoClient client = getClient(info)) {
-            MongoDatabase db = client.getDatabase(database);
+            MongoDatabase db = client.getDatabase(database != null ? database : "admin");
+
+            if ("__INFO__".equals(sql)) {
+                Document serverStatus = db.runCommand(new Document("serverStatus", 1));
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("version", serverStatus.getString("version"));
+                row.put("uptime", serverStatus.getDouble("uptime"));
+                
+                Document connections = serverStatus.get("connections", Document.class);
+                row.put("current_connections", connections != null ? connections.getInteger("current") : 0);
+                
+                Document mem = serverStatus.get("mem", Document.class);
+                row.put("resident_memory_mb", mem != null ? mem.getInteger("resident") : 0);
+
+                builder.success(true)
+                        .columns(List.of("version", "uptime", "current_connections", "resident_memory_mb"))
+                        .rows(List.of(row));
+                return builder.executionTime(System.currentTimeMillis() - startTime).build();
+            }
 
             Document queryDoc = Document.parse(sql);
             String collectionName = queryDoc.getString("collection");

@@ -144,7 +144,7 @@ html, body, #root {
 /* Navicat-style Tree */
 .navicat-tree.ant-tree {
   background: transparent;
-  color: #d1d5db;
+  color: #cccccc !important;
   font-size: 13px;
 }
 
@@ -156,6 +156,7 @@ html, body, #root {
   align-items: center;
   border-radius: 2px;
   transition: background 0.1s;
+  color: inherit !important; /* Force use of our defined color */
 }
 
 .navicat-tree.ant-tree .ant-tree-node-content-wrapper:hover {

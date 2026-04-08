@@ -39,19 +39,12 @@ public class MySQLDatabaseService implements DatabaseService {
         try (Connection conn = getConnection(info, null);
              ResultSet rs = conn.getMetaData().getCatalogs()) {
             while (rs.next()) {
-                String db = rs.getString("TABLE_CAT");
-                if (!isSystemDatabase(db)) {
-                    databases.add(db);
-                }
+                databases.add(rs.getString("TABLE_CAT"));
             }
         } catch (SQLException e) {
             log.error("Failed to get databases", e);
         }
         return databases;
-    }
-
-    private boolean isSystemDatabase(String db) {
-        return Arrays.asList("information_schema", "mysql", "performance_schema", "sys").contains(db.toLowerCase());
     }
 
     @Override
@@ -114,43 +107,46 @@ public class MySQLDatabaseService implements DatabaseService {
     public QueryResult executeQuery(ConnectionInfo info, String database, String sql, Integer page, Integer pageSize) {
         long startTime = System.currentTimeMillis();
         QueryResult.QueryResultBuilder builder = QueryResult.builder();
-        List<String> columns = new ArrayList<>();
-        List<Map<String, Object>> rows = new ArrayList<>();
 
         try (Connection conn = getConnection(info, database);
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
+             Statement stmt = conn.createStatement()) {
 
-            ResultSetMetaData metaData = rs.getMetaData();
-            int columnCount = metaData.getColumnCount();
+            boolean hasResultSet = stmt.execute(sql);
 
-            for (int i = 1; i <= columnCount; i++) {
-                columns.add(metaData.getColumnName(i));
-            }
-
-            int offset = (page != null && page > 0) ? (page - 1) * (pageSize != null ? pageSize : 100) : 0;
-            int limit = pageSize != null ? pageSize : 1000;
-            int count = 0;
-
-            while (rs.next()) {
-                if (count >= offset + limit) break;
-                if (count >= offset) {
-                    Map<String, Object> row = new LinkedHashMap<>();
+            if (hasResultSet) {
+                try (ResultSet rs = stmt.getResultSet()) {
+                    ResultSetMetaData metaData = rs.getMetaData();
+                    int columnCount = metaData.getColumnCount();
+                    List<String> columns = new ArrayList<>();
                     for (int i = 1; i <= columnCount; i++) {
-                        row.put(metaData.getColumnName(i), rs.getObject(i));
+                        columns.add(metaData.getColumnName(i));
                     }
-                    rows.add(row);
-                }
-                count++;
-            }
 
-            builder.success(true)
-                    .columns(columns)
-                    .rows(rows)
-                    .message("Query executed successfully");
+                    List<Map<String, Object>> rows = new ArrayList<>();
+                    int offset = (page != null && page > 0) ? (page - 1) * (pageSize != null ? pageSize : 100) : 0;
+                    int limit = pageSize != null ? pageSize : 1000;
+                    int count = 0;
+
+                    while (rs.next()) {
+                        if (count >= offset + limit) break;
+                        if (count >= offset) {
+                            Map<String, Object> row = new LinkedHashMap<>();
+                            for (int i = 1; i <= columnCount; i++) {
+                                row.put(metaData.getColumnName(i), rs.getObject(i));
+                            }
+                            rows.add(row);
+                        }
+                        count++;
+                    }
+                    builder.success(true).columns(columns).rows(rows).message("Query executed successfully");
+                }
+            } else {
+                int affectedRows = stmt.getUpdateCount();
+                builder.success(true).affectedRows(affectedRows).message("Statement executed successfully");
+            }
 
         } catch (SQLException e) {
-            log.error("Query execution failed", e);
+            log.error("Universal SQL execution failed", e);
             builder.success(false).message(e.getMessage());
         }
 

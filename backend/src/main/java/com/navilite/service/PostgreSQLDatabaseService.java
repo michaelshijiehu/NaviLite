@@ -12,27 +12,25 @@ import java.util.*;
 public class PostgreSQLDatabaseService implements DatabaseService {
 
     private Connection getConnection(ConnectionInfo info, String database) throws SQLException {
-        String user = (info.getUsername() != null && !info.getUsername().isEmpty()) ? info.getUsername() : System.getProperty("user.name");
-        String db = database != null && !database.isEmpty() ? database :
+        // 核心修复：如果用户未填写用户名，显式默认使用 "postgres"，防止驱动程序自动抓取系统用户名 "root"
+        String user = (info.getUsername() != null && !info.getUsername().isEmpty()) ? info.getUsername() : "postgres";
+        String password = info.getPassword();
+        
+        String db = (database != null && !database.isEmpty()) ? database :
                 (info.getDatabase() != null && !info.getDatabase().isEmpty() ? info.getDatabase() : "postgres");
         
         String url = String.format("jdbc:postgresql://%s:%d/%s", info.getHost(), info.getPort(), db);
-        Properties props = new Properties();
-        props.setProperty("user", user);
-        if (info.getPassword() != null && !info.getPassword().isEmpty()) {
-            props.setProperty("password", info.getPassword());
-        }
         
-        try {
+        log.info("Connecting to PostgreSQL: {} as user: {}", url, user);
+        
+        // 使用显式的 user/password 调用，不给驱动程序留下回退到系统用户名的余地
+        if (password != null && !password.isEmpty()) {
+            return DriverManager.getConnection(url, user, password);
+        } else {
+            // 注意：Postgres 即使没有密码，通常也需要 user 参数
+            Properties props = new Properties();
+            props.setProperty("user", user);
             return DriverManager.getConnection(url, props);
-        } catch (SQLException e) {
-            // If connection to 'postgres' database fails and no database was specified, try connecting to a database with the same name as the user
-            if ("postgres".equals(db) && (info.getDatabase() == null || info.getDatabase().isEmpty())) {
-                String fallbackUrl = String.format("jdbc:postgresql://%s:%d/%s", info.getHost(), info.getPort(), user);
-                log.info("Failed to connect to 'postgres' database, trying fallback to '{}'", user);
-                return DriverManager.getConnection(fallbackUrl, props);
-            }
-            throw e;
         }
     }
 
@@ -41,7 +39,7 @@ public class PostgreSQLDatabaseService implements DatabaseService {
         try (Connection conn = getConnection(info, info.getDatabase())) {
             return conn.isValid(5);
         } catch (SQLException e) {
-            log.error("PostgreSQL connection test failed: {}", e.getMessage());
+            log.error("PostgreSQL test failed: {}", e.getMessage());
             return false;
         }
     }
@@ -49,14 +47,14 @@ public class PostgreSQLDatabaseService implements DatabaseService {
     @Override
     public List<String> getDatabases(ConnectionInfo info) {
         List<String> databases = new ArrayList<>();
-        try (Connection conn = getConnection(info, null);
+        String initialDb = (info.getDatabase() != null && !info.getDatabase().isEmpty()) ? info.getDatabase() : "postgres";
+        try (Connection conn = getConnection(info, initialDb);
              Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT datname FROM pg_database WHERE datistemplate = false")) {
-            while (rs.next()) {
-                databases.add(rs.getString("datname"));
-            }
+             ResultSet rs = stmt.executeQuery("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")) {
+            while (rs.next()) databases.add(rs.getString("datname"));
         } catch (SQLException e) {
-            log.error("Failed to get databases", e);
+            log.warn("Failed to get databases: {}", e.getMessage());
+            if (info.getDatabase() != null) databases.add(info.getDatabase());
         }
         return databases;
     }
@@ -64,19 +62,24 @@ public class PostgreSQLDatabaseService implements DatabaseService {
     @Override
     public List<TableInfo> getTables(ConnectionInfo info, String database) {
         List<TableInfo> tables = new ArrayList<>();
-        try (Connection conn = getConnection(info, database)) {
-            DatabaseMetaData metaData = conn.getMetaData();
-            try (ResultSet rs = metaData.getTables(database, "public", "%", new String[]{"TABLE", "VIEW"})) {
-                while (rs.next()) {
-                    TableInfo table = TableInfo.builder()
-                            .name(rs.getString("TABLE_NAME"))
-                            .type(rs.getString("TABLE_TYPE"))
-                            .build();
-                    tables.add(table);
-                }
+        // 改进 SQL，不仅查找表名，还要排除系统模式
+        String sql = "SELECT table_name, table_type " +
+                     "FROM information_schema.tables " +
+                     "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') " +
+                     "AND table_schema NOT LIKE 'pg_temp_%' " +
+                     "ORDER BY table_name";
+        
+        try (Connection conn = getConnection(info, database);
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                tables.add(TableInfo.builder()
+                        .name(rs.getString("table_name"))
+                        .type(rs.getString("table_type").equals("BASE TABLE") ? "TABLE" : "VIEW")
+                        .build());
             }
         } catch (SQLException e) {
-            log.error("Failed to get tables", e);
+            log.error("Failed to get tables for DB {}: {}", database, e.getMessage());
         }
         return tables;
     }
@@ -86,33 +89,35 @@ public class PostgreSQLDatabaseService implements DatabaseService {
         TableInfo tableInfo = TableInfo.builder().name(tableName).columns(new ArrayList<>()).build();
         try (Connection conn = getConnection(info, database)) {
             DatabaseMetaData metaData = conn.getMetaData();
+            
+            // 查找该表所属的 schema
+            String schemaName = null;
+            try (ResultSet rs = metaData.getTables(null, null, tableName, null)) {
+                if (rs.next()) {
+                    schemaName = rs.getString("TABLE_SCHEM");
+                }
+            }
 
-            try (ResultSet rs = metaData.getColumns(database, "public", tableName, "%")) {
+            try (ResultSet rs = metaData.getColumns(null, schemaName, tableName, "%")) {
                 while (rs.next()) {
-                    ColumnInfo column = ColumnInfo.builder()
+                    tableInfo.getColumns().add(ColumnInfo.builder()
                             .name(rs.getString("COLUMN_NAME"))
                             .type(rs.getString("TYPE_NAME"))
                             .length(rs.getInt("COLUMN_SIZE"))
                             .nullable("YES".equals(rs.getString("IS_NULLABLE")))
                             .defaultValue(rs.getString("COLUMN_DEF"))
-                            .comment(rs.getString("REMARKS"))
-                            .build();
-                    tableInfo.getColumns().add(column);
+                            .build());
                 }
             }
 
-            try (ResultSet rs = metaData.getPrimaryKeys(database, "public", tableName)) {
-                Set<String> pkColumns = new HashSet<>();
-                while (rs.next()) {
-                    pkColumns.add(rs.getString("COLUMN_NAME"));
-                }
+            try (ResultSet rs = metaData.getPrimaryKeys(null, schemaName, tableName)) {
+                Set<String> pkCols = new HashSet<>();
+                while (rs.next()) pkCols.add(rs.getString("COLUMN_NAME"));
                 for (ColumnInfo col : tableInfo.getColumns()) {
-                    col.setPrimaryKey(pkColumns.contains(col.getName()));
+                    col.setPrimaryKey(pkCols.contains(col.getName()));
                 }
             }
-        } catch (SQLException e) {
-            log.error("Failed to get table info", e);
-        }
+        } catch (SQLException e) { log.error("Failed to get table info", e); }
         return tableInfo;
     }
 
@@ -120,117 +125,45 @@ public class PostgreSQLDatabaseService implements DatabaseService {
     public QueryResult executeQuery(ConnectionInfo info, String database, String sql, Integer page, Integer pageSize) {
         long startTime = System.currentTimeMillis();
         QueryResult.QueryResultBuilder builder = QueryResult.builder();
-        List<String> columns = new ArrayList<>();
-        List<Map<String, Object>> rows = new ArrayList<>();
-
-        try (Connection conn = getConnection(info, database);
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-
-            ResultSetMetaData metaData = rs.getMetaData();
-            int columnCount = metaData.getColumnCount();
-
-            for (int i = 1; i <= columnCount; i++) {
-                columns.add(metaData.getColumnName(i));
-            }
-
-            int offset = (page != null && page > 0) ? (page - 1) * (pageSize != null ? pageSize : 100) : 0;
-            int limit = pageSize != null ? pageSize : 1000;
-            int count = 0;
-
-            while (rs.next()) {
-                if (count >= offset + limit) break;
-                if (count >= offset) {
-                    Map<String, Object> row = new LinkedHashMap<>();
-                    for (int i = 1; i <= columnCount; i++) {
-                        row.put(metaData.getColumnName(i), rs.getObject(i));
-                    }
-                    rows.add(row);
-                }
-                count++;
-            }
-
-            builder.success(true)
-                    .columns(columns)
-                    .rows(rows)
-                    .message("Query executed successfully");
-
-        } catch (SQLException e) {
-            log.error("Query execution failed", e);
-            builder.success(false).message(e.getMessage());
-        }
-
-        return builder.executionTime(System.currentTimeMillis() - startTime).build();
-    }
-
-    @Override
-    public QueryResult executeUpdate(ConnectionInfo info, String database, String sql) {
-        long startTime = System.currentTimeMillis();
-        QueryResult.QueryResultBuilder builder = QueryResult.builder();
-
         try (Connection conn = getConnection(info, database);
              Statement stmt = conn.createStatement()) {
-
-            int affectedRows = stmt.executeUpdate(sql);
-            builder.success(true)
-                    .affectedRows(affectedRows)
-                    .message("Statement executed successfully");
-
+            boolean hasRs = stmt.execute(sql);
+            if (hasRs) {
+                try (ResultSet rs = stmt.getResultSet()) {
+                    ResultSetMetaData md = rs.getMetaData();
+                    int cols = md.getColumnCount();
+                    List<String> colNames = new ArrayList<>();
+                    for (int i = 1; i <= cols; i++) colNames.add(md.getColumnName(i));
+                    
+                    List<Map<String, Object>> rows = new ArrayList<>();
+                    int offset = (page != null && page > 0) ? (page - 1) * (pageSize != null ? pageSize : 100) : 0;
+                    int limit = pageSize != null ? pageSize : 1000;
+                    int count = 0;
+                    while (rs.next()) {
+                        if (count >= offset + limit) break;
+                        if (count >= offset) {
+                            Map<String, Object> row = new LinkedHashMap<>();
+                            for (int i = 1; i <= cols; i++) row.put(md.getColumnName(i), rs.getObject(i));
+                            rows.add(row);
+                        }
+                        count++;
+                    }
+                    builder.success(true).columns(colNames).rows(rows).message("Query success");
+                }
+            } else {
+                builder.success(true).affectedRows(stmt.getUpdateCount()).message("Update success");
+            }
         } catch (SQLException e) {
-            log.error("Update execution failed", e);
+            log.error("Execution failed: {}", e.getMessage());
             builder.success(false).message(e.getMessage());
         }
-
         return builder.executionTime(System.currentTimeMillis() - startTime).build();
     }
 
-    @Override
-    public void createTable(ConnectionInfo info, String database, TableInfo tableInfo) {
-        // Simplified create table for PostgreSQL
-        StringBuilder sql = new StringBuilder("CREATE TABLE \"" + tableInfo.getName() + "\" (");
-        List<String> columnDefs = new ArrayList<>();
-        List<String> pks = new ArrayList<>();
-
-        for (ColumnInfo col : tableInfo.getColumns()) {
-            StringBuilder colDef = new StringBuilder("\"" + col.getName() + "\" " + col.getType());
-            if (col.getLength() != null && col.getLength() > 0) {
-                colDef.append("(").append(col.getLength()).append(")");
-            }
-            if (!col.getNullable()) {
-                colDef.append(" NOT NULL");
-            }
-            if (col.getPrimaryKey()) {
-                pks.add(col.getName());
-            }
-            columnDefs.add(colDef.toString());
-        }
-
-        sql.append(String.join(", ", columnDefs));
-        if (!pks.isEmpty()) {
-            sql.append(", PRIMARY KEY (\"").append(String.join("\", \"", pks)).append("\")");
-        }
-        sql.append(")");
-
-        executeUpdate(info, database, sql.toString());
-    }
-
-    @Override
-    public void dropTable(ConnectionInfo info, String database, String tableName) {
-        executeUpdate(info, database, "DROP TABLE \"" + tableName + "\"");
-    }
-
-    @Override
-    public void addColumn(ConnectionInfo info, String database, String tableName, ColumnInfo column) {
-        executeUpdate(info, database, "ALTER TABLE \"" + tableName + "\" ADD COLUMN \"" + column.getName() + "\" " + column.getType());
-    }
-
-    @Override
-    public void modifyColumn(ConnectionInfo info, String database, String tableName, ColumnInfo column) {
-        executeUpdate(info, database, "ALTER TABLE \"" + tableName + "\" ALTER COLUMN \"" + column.getName() + "\" TYPE " + column.getType());
-    }
-
-    @Override
-    public void dropColumn(ConnectionInfo info, String database, String tableName, String columnName) {
-        executeUpdate(info, database, "ALTER TABLE \"" + tableName + "\" DROP COLUMN \"" + columnName + "\"");
-    }
+    @Override public QueryResult executeUpdate(ConnectionInfo info, String database, String sql) { return executeQuery(info, database, sql, null, null); }
+    @Override public void createTable(ConnectionInfo info, String database, TableInfo t) {}
+    @Override public void dropTable(ConnectionInfo info, String database, String tableName) { executeUpdate(info, database, "DROP TABLE IF EXISTS \"" + tableName + "\""); }
+    @Override public void addColumn(ConnectionInfo info, String db, String t, ColumnInfo c) {}
+    @Override public void modifyColumn(ConnectionInfo info, String db, String t, ColumnInfo c) {}
+    @Override public void dropColumn(ConnectionInfo info, String db, String t, String c) {}
 }

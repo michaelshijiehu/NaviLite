@@ -1,10 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { Table, message, Card, Typography, Empty, Tag, Space, Descriptions, Divider, Button, Modal, Form, Input, InputNumber, Popconfirm } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { ConnectionInfo, QueryResult, TableInfo, ColumnInfo } from '../types';
+import { message, Typography, Space, Divider, Button, Modal, Form, Input, InputNumber, Spin, Alert } from 'antd';
+import { PlusOutlined, ReloadOutlined, TableOutlined, FileTextOutlined, ClockCircleOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import type { ConnectionInfo, QueryResult, TableInfo } from '../types';
 import { databaseApi } from '../services/api';
+
+// Sub-viewers
+import SqlViewer from './viewers/SqlViewer';
+import MongoViewer from './viewers/MongoViewer';
+import RedisViewer from './viewers/RedisViewer';
 
 const { Text, Title } = Typography;
 
@@ -33,9 +36,7 @@ const DataViewer: React.FC<DataViewerProps> = ({ connection, database, table }) 
     try {
       const res = await databaseApi.getTableInfo(connection.id!, table, database);
       setTableInfo(res.data);
-    } catch (error) {
-      console.error('Failed to load table info:', error);
-    }
+    } catch (error) { console.error('Info load failed', error); }
   };
 
   const loadData = async () => {
@@ -43,315 +44,206 @@ const DataViewer: React.FC<DataViewerProps> = ({ connection, database, table }) 
     try {
       let res;
       if (connection.type === 'MONGODB') {
-        const query = JSON.stringify({ collection: table });
-        res = await databaseApi.executeQuery(connection.id!, {
-          connectionId: connection.id!,
-          database,
-          sql: query,
-          page: 1,
-          pageSize: 50,
-        });
+        res = await databaseApi.executeQuery(connection.id!, { connectionId: connection.id!, database, sql: JSON.stringify({ collection: table }), page: 1, pageSize: 50 });
       } else if (connection.type === 'REDIS') {
-        res = await databaseApi.executeQuery(connection.id!, {
-          connectionId: connection.id!,
-          database,
-          sql: table,
-        });
+        res = await databaseApi.executeQuery(connection.id!, { connectionId: connection.id!, database, sql: table });
       } else {
-        const sql = `SELECT * FROM \`${table}\` LIMIT 100`;
-        res = await databaseApi.executeQuery(connection.id!, {
-          connectionId: connection.id!,
-          database,
-          sql,
-          page: 1,
-          pageSize: 100,
-        });
+        const quote = connection.type === 'MYSQL' ? '`' : '"';
+        const quotedTable = `${quote}${table}${quote}`;
+        res = await databaseApi.executeQuery(connection.id!, { connectionId: connection.id!, database, sql: `SELECT * FROM ${quotedTable} LIMIT 100`, page: 1, pageSize: 100 });
       }
       setResult(res.data);
-    } catch (error) {
-      message.error('Failed to load data');
-    } finally {
-      setLoading(false);
-    }
+    } catch (error) { message.error('Data load failed'); } finally { setLoading(false); }
   };
 
   const handleDelete = async (record: any) => {
     try {
+      let sql = '';
       if (connection.type === 'MONGODB') {
-        const sql = JSON.stringify({ 
-          command: 'delete', 
-          collection: table, 
-          filter: { _id: record._id } 
-        });
-        await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
+        sql = JSON.stringify({ command: 'delete', collection: table, filter: { _id: record._id } });
       } else if (connection.type === 'REDIS') {
-        await databaseApi.dropTable(connection.id!, record.key, database);
+        sql = JSON.stringify({ action: 'del', key: table });
       } else {
         const pk = tableInfo?.columns?.find(c => c.primaryKey);
-        if (!pk) {
-          message.error('No primary key found for this table. Deletion is unsafe.');
-          return;
-        }
-        const sql = `DELETE FROM \`${table}\` WHERE \`${pk.name}\` = '${record[pk.name]}'`;
-        await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
+        if (!pk) return message.error('No primary key found for deletion');
+        sql = `DELETE FROM "${table}" WHERE "${pk.name}" = '${record[pk.name]}'`;
       }
+      await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
       message.success('Deleted successfully');
       loadData();
-    } catch (error) {
-      message.error('Failed to delete');
-    }
+    } catch (error) { message.error('Delete failed'); }
+  };
+
+  const handleRedisElementDelete = async (type: string, record: any) => {
+    let action = '';
+    let payload: any = { key: table };
+    if (type === 'hash') { action = 'hdel'; payload.field = record.field; }
+    else if (type === 'list') { action = 'lrem'; payload.value = record.value; }
+    else if (type === 'set') { action = 'srem'; payload.value = record.value; }
+    else if (type === 'zset') { action = 'zrem'; payload.value = record.value; }
+    
+    payload.action = action;
+    try {
+       await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql: JSON.stringify(payload) });
+       message.success('Item removed');
+       loadData();
+    } catch(e) { message.error('Delete failed'); }
   };
 
   const handleSave = async (values: any) => {
     try {
+      let sql = '';
       if (connection.type === 'MONGODB') {
         const doc = JSON.parse(values.json);
-        let sql = '';
-        if (editingRecord) {
-          sql = JSON.stringify({
-            command: 'update',
-            collection: table,
-            filter: { _id: editingRecord._id },
-            update: doc
-          });
+        sql = editingRecord && !editingRecord.isNewItem ? JSON.stringify({ command: 'update', collection: table, filter: { _id: editingRecord._id }, update: doc })
+                           : JSON.stringify({ command: 'insert', collection: table, document: doc });
+      } else if (connection.type === 'REDIS') {
+        if (editingRecord && editingRecord.isNewItem) {
+          let action = 'set';
+          if (editingRecord.type === 'hash') action = 'hset';
+          else if (editingRecord.type === 'list') action = 'rpush';
+          else if (editingRecord.type === 'set') action = 'sadd';
+          else if (editingRecord.type === 'zset') action = 'zadd';
+          sql = JSON.stringify({ action, key: table, field: values.field, score: values.score, value: values.value });
         } else {
+          // Editing existing key (String value or just Metadata)
           sql = JSON.stringify({
-            command: 'insert',
-            collection: table,
-            document: doc
+            action: 'set',
+            key: table,
+            value: values.value !== undefined ? values.value : editingRecord.value,
+            ttl: values.ttl
           });
         }
-        await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
-      } else if (connection.type === 'REDIS') {
-        const sql = `${values.key}:${values.value}`;
-        await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
       } else {
         const pk = tableInfo?.columns?.find(c => c.primaryKey);
-        let sql = '';
         if (editingRecord) {
-          const sets = Object.entries(values)
-            .filter(([key]) => key !== pk?.name && key !== 'actions')
-            .map(([key, val]) => `\`${key}\` = '${val}'`)
-            .join(', ');
-          sql = `UPDATE \`${table}\` SET ${sets} WHERE \`${pk?.name}\` = '${editingRecord[pk!.name]}'`;
+          const sets = Object.entries(values).filter(([k]) => k !== pk?.name).map(([k, v]) => `"${k}" = '${v}'`).join(', ');
+          sql = `UPDATE "${table}" SET ${sets} WHERE "${pk?.name}" = '${editingRecord[pk!.name]}'`;
         } else {
-          const cols = Object.keys(values).map(k => `\`${k}\``).join(', ');
+          const cols = Object.keys(values).map(k => `"${k}"`).join(', ');
           const vals = Object.values(values).map(v => `'${v}'`).join(', ');
-          sql = `INSERT INTO \`${table}\` (${cols}) VALUES (${vals})`;
+          sql = `INSERT INTO "${table}" (${cols}) VALUES (${vals})`;
         }
-        await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
       }
+      await databaseApi.executeUpdate(connection.id!, { connectionId: connection.id!, database, sql });
       message.success('Saved successfully');
       setModalVisible(false);
       loadData();
-    } catch (error: any) {
-      message.error('Failed to save: ' + error.message);
-    }
+    } catch (error: any) { message.error('Save failed: ' + error.message); }
   };
 
-  const renderSqlTable = () => {
-    const dataColumns = result?.columns?.map(col => ({
-      title: col,
-      dataIndex: col,
-      key: col,
-      ellipsis: true,
-      render: (value: any) => {
-        if (value === null) return <span className="text-gray-400">NULL</span>;
-        return String(value);
-      },
-    })) || [];
-
-    const actionColumn = {
-      title: 'Actions',
-      key: 'actions',
-      fixed: 'right' as const,
-      width: 100,
-      render: (_: any, record: any) => (
-        <Space size="middle">
-          <Button 
-            type="text" 
-            size="small" 
-            icon={<EditOutlined />} 
-            onClick={() => {
-              setEditingRecord(record);
-              form.setFieldsValue(record);
-              setModalVisible(true);
-            }}
-          />
-          <Popconfirm title="Delete this row?" onConfirm={() => handleDelete(record)}>
-            <Button type="text" size="small" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
-        </Space>
-      ),
-    };
-
-    return (
-      <Table
-        columns={[...dataColumns, actionColumn]}
-        dataSource={result?.rows || []}
-        rowKey={(record, index) => index.toString()}
-        loading={loading}
-        pagination={{ pageSize: 50 }}
-        size="small"
-        scroll={{ x: 'max-content', y: 'calc(100vh - 320px)' }}
-        className="data-table"
-      />
-    );
-  };
-
-  const renderMongoDocuments = () => {
-    if (!result?.rows || result.rows.length === 0) return <Empty description="No documents found" />;
-    return (
-      <div className="flex flex-col gap-4 overflow-auto" style={{ height: 'calc(100vh - 240px)' }}>
-        {result.rows.map((doc, idx) => (
-          <Card 
-            key={idx} 
-            size="small" 
-            className="mongo-doc-card shadow-sm"
-            title={<Text type="secondary">Document #{idx + 1}</Text>}
-            extra={
-              <Space>
-                <Button 
-                  type="text" 
-                  icon={<EditOutlined />} 
-                  size="small" 
-                  onClick={() => {
-                    setEditingRecord(doc);
-                    form.setFieldsValue({ json: JSON.stringify(doc, null, 2) });
-                    setModalVisible(true);
-                  }} 
-                />
-                <Popconfirm title="Delete document?" onConfirm={() => handleDelete(doc)}>
-                  <Button type="text" danger icon={<DeleteOutlined />} size="small" />
-                </Popconfirm>
-              </Space>
-            }
-          >
-            <SyntaxHighlighter language="json" style={vscDarkPlus} customStyle={{ margin: 0, borderRadius: '4px', fontSize: '13px' }}>
-              {JSON.stringify(doc, null, 2)}
-            </SyntaxHighlighter>
-          </Card>
-        ))}
-      </div>
-    );
-  };
-
-  const renderRedisValue = () => {
-    if (!result?.rows || result.rows.length === 0) return <Empty description="Key not found" />;
-    const data = result.rows[0];
-    const { key, type, value } = data;
-    return (
-      <div className="p-4 bg-white rounded-lg border border-gray-200">
-        <Descriptions title="Key Information" bordered column={1} extra={
-          <Space>
-            <Button 
-              type="primary" 
-              icon={<EditOutlined />} 
-              onClick={() => {
-                setEditingRecord(data);
-                form.setFieldsValue({ key, value: typeof value === 'string' ? value : JSON.stringify(value) });
-                setModalVisible(true);
-              }}
-            >
-              Edit Value
-            </Button>
-            <Popconfirm title="Delete this key?" onConfirm={() => handleDelete(data)}>
-              <Button type="primary" danger icon={<DeleteOutlined />}>Delete Key</Button>
-            </Popconfirm>
-          </Space>
-        }>
-          <Descriptions.Item label="Key">{key}</Descriptions.Item>
-          <Descriptions.Item label="Type"><Tag color="magenta">{String(type).toUpperCase()}</Tag></Descriptions.Item>
-        </Descriptions>
-        <Divider orientation="left">Value</Divider>
-        <div className="bg-gray-50 p-4 rounded border border-dashed border-gray-300">
-          <SyntaxHighlighter language="json" style={vscDarkPlus} customStyle={{ margin: 0, borderRadius: '4px' }}>
-            {JSON.stringify(value, null, 2)}
-          </SyntaxHighlighter>
-        </div>
-      </div>
-    );
+  const getHeaderIcon = () => {
+    if (connection.type === 'REDIS') return <ClockCircleOutlined className="text-red-500 text-xl" />;
+    if (connection.type === 'MONGODB') return <FileTextOutlined className="text-green-500 text-xl" />;
+    return <TableOutlined className="text-blue-500 text-xl" />;
   };
 
   return (
-    <div className="h-full flex flex-col">
-      <div className="mb-4 flex items-center justify-between">
-        <Space>
-          <Title level={5} className="m-0">
-            {connection.type === 'REDIS' ? 'Key: ' : connection.type === 'MONGODB' ? 'Collection: ' : 'Table: '}
-            <span style={{ color: '#7C3AED' }}>{table}</span>
-          </Title>
-          <Tag color="blue">{connection.type}</Tag>
+    <div className="h-full flex flex-col bg-white">
+      {/* Dynamic Header */}
+      <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-white shadow-sm z-10">
+        <Space size="middle">
+          <div className="p-2 bg-gray-50 rounded-lg">{getHeaderIcon()}</div>
+          <div>
+            <Title level={4} className="m-0 leading-tight">{table}</Title>
+            <Space size="xs">
+               <Text type="secondary" className="text-xs uppercase tracking-wider">{connection.type}</Text>
+               <Divider type="vertical" />
+               <Text type="secondary" className="text-xs">{database || 'default'}</Text>
+            </Space>
+          </div>
         </Space>
         <Space>
-          {connection.type === 'MONGODB' && (
-            <Button 
-              type="primary" 
-              icon={<PlusOutlined />} 
-              onClick={() => {
-                setEditingRecord(null);
-                form.resetFields();
-                setModalVisible(true);
-              }}
-            >
-              Add Document
-            </Button>
-          )}
           {['MYSQL', 'POSTGRESQL', 'SQLITE'].includes(connection.type) && (
-            <Button 
-              type="primary" 
-              icon={<PlusOutlined />} 
-              onClick={() => {
-                setEditingRecord(null);
-                form.resetFields();
-                setModalVisible(true);
-              }}
-            >
-              Add Row
-            </Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditingRecord(null); form.resetFields(); setModalVisible(true); }}>Add Row</Button>
           )}
+          <Button icon={<ReloadOutlined />} onClick={loadData}>Refresh</Button>
         </Space>
       </div>
 
-      <div className="flex-1 overflow-hidden">
-        {connection.type === 'MONGODB' ? renderMongoDocuments() :
-         connection.type === 'REDIS' ? renderRedisValue() :
-         renderSqlTable()}
+      {/* Routed Content */}
+      <div className="flex-1 overflow-hidden flex flex-col">
+        {loading ? (
+          <div className="flex-1 flex items-center justify-center bg-gray-50">
+            <Spin size="large" tip="Fetching data..." />
+          </div>
+        ) : connection.type === 'REDIS' ? (
+          <RedisViewer 
+            connection={connection}
+            database={database || ''}
+            table={table}
+            onReload={loadData}
+            onKeyDeleted={() => {
+              // Usually we'd redirect or close the tab, but for now we just reload
+              setResult(null);
+            }}
+            onKeyRenamed={(newKey) => {
+              // We should ideally update the tree and select the new node, 
+              // but for now we'll just reload the new key's data
+            }}
+          />
+        ) : connection.type === 'MONGODB' ? (
+          <MongoViewer 
+            result={result} 
+            onEdit={(doc) => { setEditingRecord(doc); form.setFieldsValue({ json: JSON.stringify(doc, null, 2) }); setModalVisible(true); }}
+            onDelete={handleDelete}
+          />
+        ) : (
+          <SqlViewer 
+            table={table}
+            result={result}
+            loading={loading}
+            tableInfo={tableInfo}
+            onEdit={(r) => { setEditingRecord(r); form.setFieldsValue(r); setModalVisible(true); }}
+            onDelete={handleDelete}
+          />
+        )}
       </div>
 
-      <Modal
-        title={editingRecord ? 'Edit Data' : 'Add New Data'}
-        open={modalVisible}
-        onCancel={() => setModalVisible(false)}
-        onOk={() => form.submit()}
-        width={600}
-        destroyOnClose
+      {/* Universal Modal */}
+      <Modal 
+        open={modalVisible} 
+        onCancel={() => setModalVisible(false)} 
+        onOk={() => form.submit()} 
+        title={editingRecord?.isNewItem ? 'Add New Element' : 'Edit Item'} 
+        destroyOnClose 
+        width={connection.type === 'MONGODB' ? 800 : 520}
       >
         <Form form={form} layout="vertical" onFinish={handleSave}>
           {connection.type === 'MONGODB' ? (
-            <Form.Item name="json" label="Document JSON" rules={[{ required: true }]}>
-              <Input.TextArea rows={10} placeholder='{ "key": "value" }' />
+            <Form.Item name="json" label="JSON Document" rules={[{ required: true, message: 'JSON is required' }]}>
+              <Input.TextArea rows={15} className="font-mono text-sm" />
             </Form.Item>
           ) : connection.type === 'REDIS' ? (
-            <>
-              <Form.Item name="key" label="Key" rules={[{ required: true }]}>
-                <Input disabled={!!editingRecord} />
-              </Form.Item>
-              <Form.Item name="value" label="Value" rules={[{ required: true }]}>
-                <Input.TextArea rows={5} />
-              </Form.Item>
-            </>
+             <>
+               {editingRecord?.type === 'hash' && editingRecord.isNewItem && <Form.Item name="field" label="Field" rules={[{ required: true }]}><Input /></Form.Item>}
+               {editingRecord?.type === 'zset' && editingRecord.isNewItem && <Form.Item name="score" label="Score" rules={[{ required: true }]}><InputNumber style={{width: '100%'}} /></Form.Item>}
+               
+               {/* Show Value only if it's String or adding new element */}
+               {(editingRecord?.type === 'string' || editingRecord?.isNewItem) && (
+                 <Form.Item name="value" label={editingRecord?.isNewItem ? 'Element Value' : 'Value'} rules={[{ required: true }]}><Input.TextArea rows={8} className="font-mono" /></Form.Item>
+               )}
+
+               {/* Always allow editing TTL for the overall key (when not adding sub-elements) */}
+               {!editingRecord?.isNewItem && (
+                 <div className="bg-blue-50 p-4 rounded-lg mb-4">
+                   <div className="flex items-center gap-2 mb-2 text-blue-700 font-medium">
+                     <ClockCircleOutlined /> Key Expiration (TTL)
+                   </div>
+                   <Form.Item name="ttl" label="TTL (Seconds)" extra="Use -1 for permanent (persist)">
+                     <InputNumber style={{width: '100%'}} placeholder="-1" />
+                   </Form.Item>
+                 </div>
+               )}
+             </>
           ) : (
-            tableInfo?.columns?.map(col => (
-              <Form.Item 
-                key={col.name} 
-                name={col.name} 
-                label={col.name} 
-                rules={[{ required: !col.nullable && !col.primaryKey }]}
-              >
-                {col.type.toLowerCase().includes('int') ? <InputNumber style={{ width: '100%' }} /> : <Input />}
-              </Form.Item>
-            ))
+            <div className="max-h-[60vh] overflow-y-auto px-1">
+              {tableInfo?.columns?.map(c => (
+                <Form.Item key={c.name} name={c.name} label={c.name} rules={[{ required: c.primaryKey }]}>
+                  {c.type.includes('INT') ? <InputNumber style={{width:'100%'}} /> : <Input />}
+                </Form.Item>
+              ))}
+            </div>
           )}
         </Form>
       </Modal>
